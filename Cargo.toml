@@ -1,0 +1,18 @@
+[package]
+name = "swayfin"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libc = "0.2.189"
+libloading = "0.8"
+md-5 = "0.11.0"
+png = "0.18.1"
+smithay-client-toolkit = { version = "0.21", default-features = false, features = ["calloop"] }
+xkbcommon-dl = "0.4.2"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
