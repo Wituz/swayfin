@@ -463,6 +463,23 @@ impl View {
             .collect()
     }
 
+    /// The selected rows in list order: (path, is folder).
+    pub fn selected_entries(&self) -> Vec<(PathBuf, bool)> {
+        (0..self.selected.len())
+            .filter(|&i| self.selected[i])
+            .map(|i| {
+                let e = &self.listing.entries[i];
+                (self.listing.path.join(&e.raw), e.is_dir)
+            })
+            .collect()
+    }
+
+    /// The name of the selection, if it is exactly one file.
+    pub fn selected_file_name(&self) -> Option<String> {
+        let e = &self.listing.entries[self.single_selected()?];
+        (!e.is_dir).then(|| e.raw.to_string_lossy().into_owned())
+    }
+
     /// The single selected row, if exactly one is selected.
     fn single_selected(&self) -> Option<usize> {
         let mut rows = (0..self.selected.len()).filter(|&i| self.selected[i]);

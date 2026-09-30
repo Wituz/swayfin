@@ -1,12 +1,14 @@
 //! Wayland plumbing: one xdg toplevel, drawn into wl_shm buffers on demand.
 
 mod clipboard;
+mod dialog;
 mod dnd;
 mod keyboard;
 
 use std::{
     collections::{HashSet, VecDeque},
     os::fd::AsFd,
+    ffi::OsString,
     path::PathBuf,
     rc::Rc,
     thread,
@@ -57,6 +59,7 @@ use smithay_client_toolkit::{
 };
 
 use crate::{
+    chooser::Chooser,
     fs::{self, Listing},
     modal::{self, Modal, Outcome, Prompt},
     ops::{self, JobMsg},
@@ -71,6 +74,8 @@ use crate::{
 };
 
 const APP_ID: &str = "swayfin";
+/// File dialogs get their own, so Sway can float them.
+const CHOOSER_APP_ID: &str = "swayfin-chooser";
 /// Mouse side buttons: evdev BTN_SIDE/BTN_BACK and BTN_EXTRA/BTN_FORWARD (mice use
 /// either pair).
 const BACK_BUTTONS: [u32; 2] = [0x113, 0x116];
@@ -168,6 +173,8 @@ pub struct App {
     pointer_pos: Option<(f64, f64)>,
     /// Shown one at a time, front first.
     modals: VecDeque<Modal>,
+    /// Running as a file dialog for the portal.
+    chooser: Option<Chooser>,
     jobs: Sender<JobMsg>,
     thumbnailer: Thumbnailer,
     player: Player,
@@ -233,13 +240,16 @@ pub struct App {
 }
 
 impl App {
-    /// `loads` must already carry request #1 (the start folder).
+    /// `loads` must already carry request #1 (the start folder). `select` is a name in
+    /// it to select once listed.
     pub fn new(
         conn: &Connection,
         handle: LoopHandle<'static, Self>,
         loader: Sender<Loaded>,
         loads: Channel<Loaded>,
         start: PathBuf,
+        chooser: Option<Chooser>,
+        select: Option<OsString>,
     ) -> Self {
         let (globals, queue) = registry_queue_init(conn).expect("registry");
         let qh = queue.handle();
@@ -325,12 +335,26 @@ impl App {
             &qh,
         );
         window.set_title(APP_ID);
-        window.set_app_id(APP_ID);
+        window.set_app_id(if chooser.is_some() {
+            CHOOSER_APP_ID
+        } else {
+            APP_ID
+        });
         // Initial bufferless commit; the compositor answers with a configure.
         window.commit();
 
         // Sized for a typical tile; grows on first configure if needed.
         let pool = SlotPool::new(1280 * 720 * 4, &shm).expect("shm pool");
+
+        let mut view = View::new(Listing {
+            path: start.clone(),
+            entries: Vec::new(),
+            error: None,
+            dotfiles: false,
+        });
+        if let Some(name) = select {
+            view.select_on_load(name);
+        }
 
         Self {
             registry: RegistryState::new(&globals),
@@ -353,6 +377,7 @@ impl App {
             press_serial: 0,
             pointer_pos: None,
             modals: VecDeque::new(),
+            chooser,
             jobs,
             thumbnailer: Thumbnailer::new(thumbs::Ui {
                 thumbs: thumb_tx,
@@ -386,18 +411,13 @@ impl App {
             repeat: None,
             repeat_info: (25, 600),
             handle,
-            nav_path: start.clone(),
+            nav_path: start,
             back: Vec::new(),
             forward: Vec::new(),
             watcher,
             watched: None,
             refresh_scheduled: false,
-            view: View::new(Listing {
-                path: start,
-                entries: Vec::new(),
-                error: None,
-                dotfiles: false,
-            }),
+            view,
             dotfiles: false,
             qh,
             loader,
@@ -573,6 +593,10 @@ impl App {
                 ops::spawn_delete(paths, self.jobs.clone());
                 self.finish_modal(Outcome::Dismissed);
             }
+            Outcome::Replace(path) => {
+                self.finish_modal(Outcome::Dismissed);
+                self.dialog_finish(vec![path]);
+            }
             Outcome::OpenWith { file, id, save } => {
                 ops::spawn_launch(file, id, save, self.jobs.clone());
                 self.finish_modal(Outcome::Dismissed);
@@ -583,7 +607,11 @@ impl App {
 
     /// I-beam over the name field, the default arrow everywhere else.
     fn update_shape(&mut self) {
-        let want = if self.modals.front().is_some_and(Modal::hovering_field) {
+        let field = match self.modals.front() {
+            Some(modal) => modal.hovering_field(),
+            None => self.chooser.as_ref().is_some_and(Chooser::hovering_field),
+        };
+        let want = if field {
             Shape::Text
         } else {
             Shape::Default
@@ -934,6 +962,7 @@ impl App {
             Effect::None => {}
             Effect::Redraw => self.request_redraw(),
             Effect::Navigate(path) => self.go(path),
+            Effect::Open(path) if self.chooser.is_some() => self.dialog_file(path),
             Effect::Open(path) => ops::spawn_open(path, self.jobs.clone()),
             Effect::TogglePlay(path) => {
                 self.player.toggle(path);
@@ -981,6 +1010,9 @@ impl App {
         let mut canvas = Canvas::new(bytes, w as usize, h as usize);
         self.view
             .draw(&mut canvas, &self.thumbs, self.player.state(), &self.cut);
+        if let Some(ch) = &self.chooser {
+            ch.draw(&mut canvas, w as usize, h as usize);
+        }
         if let (Some(vp), Some(((vw, vh), known))) = (&self.video_preview, video_dims) {
             // Fitted like an image (never enlarged), then zoomed. mpv renders only what
             // fits the window: when zoomed past it, its own video-zoom crops the center.
@@ -1066,7 +1098,7 @@ impl WindowHandler for App {
             self.buffer = None;
             self.width = w;
             self.height = h;
-            self.view.resize(w as usize, h as usize);
+            self.view.resize(w as usize, self.list_h());
         }
         self.configured = true;
         // Configures must be answered promptly, so bypass frame pacing.
@@ -1107,7 +1139,15 @@ impl PointerHandler for App {
                 self.update_shape();
                 continue;
             }
+            let over_bar = self.dialog_pointer(&event.kind);
+            self.update_shape();
             let effect = match event.kind {
+                PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } if over_bar => {
+                    self.view.leave()
+                }
+                PointerEventKind::Press { .. } | PointerEventKind::Axis { .. } if over_bar => {
+                    Effect::None
+                }
                 PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
                     self.view.motion(x, y)
                 }
@@ -1139,6 +1179,9 @@ impl PointerHandler for App {
                 }
             };
             self.apply(effect);
+            if matches!(event.kind, PointerEventKind::Press { .. }) && !over_bar {
+                self.sync_save_name();
+            }
         }
         if self.update_preview() {
             self.request_redraw();

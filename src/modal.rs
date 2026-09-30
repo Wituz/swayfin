@@ -15,12 +15,12 @@ const PAD: usize = 12;
 const GAP: usize = 12;
 const SMALL_GAP: usize = 8;
 const MAX_COLS: usize = 60;
-const BTN_H: usize = 20;
+pub const BTN_H: usize = 20;
 const BTN_PAD: usize = CELL_W;
-const BTN_GAP: usize = 8;
+pub const BTN_GAP: usize = 8;
 const CHECK: usize = 12;
 const FIELD_COLS: usize = 40;
-const FIELD_H: usize = 20;
+pub const FIELD_H: usize = 20;
 const FIELD_PAD: usize = 4;
 const LIST_ROW_H: usize = 18;
 const LIST_MAX_ROWS: usize = 10;
@@ -43,6 +43,8 @@ pub enum Kind {
         /// The single item's name, if there is only one.
         name: Option<String>,
     },
+    /// File dialog: saving onto `path`, which exists.
+    ConfirmReplace { path: PathBuf, name: String },
     /// A one-line text prompt: a new folder's name, a new name, or a zoxide query.
     Prompt {
         purpose: Prompt,
@@ -80,6 +82,7 @@ pub enum Outcome {
     /// The prompt's text was submitted. The modal stays open until the result is known.
     Submit(String),
     Delete(Vec<PathBuf>),
+    Replace(PathBuf),
     /// Open `file` with app `id`, first saving it as the default for the type if `save`.
     OpenWith {
         file: PathBuf,
@@ -112,6 +115,70 @@ pub struct Field {
 }
 
 impl Field {
+    /// Prefilled with `text`, caret at char index `caret`.
+    pub fn new(text: &str, caret: usize) -> Self {
+        let text: Vec<char> = text.chars().collect();
+        let caret = caret.min(text.len());
+        Self { text, caret }
+    }
+
+    pub fn text(&self) -> String {
+        self.text.iter().collect()
+    }
+
+    /// Applies an editing key. Returns false for keys that don't edit (Enter, Esc, Up, Down).
+    pub fn edit(&mut self, input: Input) -> bool {
+        match input {
+            Input::Text(s) => self.insert(&s),
+            Input::Backspace { word } => self.backspace(word),
+            Input::Delete => self.delete(),
+            Input::Left => self.caret = self.caret.saturating_sub(1),
+            Input::Right => self.caret = (self.caret + 1).min(self.text.len()),
+            Input::Home => self.caret = 0,
+            Input::End => self.caret = self.text.len(),
+            Input::Enter | Input::Escape | Input::Up | Input::Down => return false,
+        }
+        true
+    }
+
+    /// Moves the caret to the char boundary nearest `px`, in a field drawn at `x` showing
+    /// `cols` columns.
+    pub fn click(&mut self, px: usize, x: usize, cols: usize) {
+        let tx = x + 1 + FIELD_PAD;
+        let col = (px.saturating_sub(tx) + CELL_W / 2) / CELL_W;
+        self.caret = (self.offset(cols) + col).min(self.text.len());
+    }
+
+    /// Columns of text that fit a field `w` pixels wide.
+    pub fn cols_for(w: usize) -> usize {
+        w.saturating_sub(2 + 2 * FIELD_PAD) / CELL_W
+    }
+
+    /// The field's box, `w` x FIELD_H at (x, y), showing `cols` columns; the caret only
+    /// when it has the keyboard.
+    pub fn draw(&self, c: &mut Canvas, x: usize, y: usize, w: usize, cols: usize, caret: bool) {
+        c.rect(x, y, w, FIELD_H, theme::BG);
+        c.frame(x, y, w, FIELD_H, theme::BORDER);
+        let (tx, ty) = (x + 1 + FIELD_PAD, y + (FIELD_H - CELL_H) / 2);
+        let offset = self.offset(cols);
+        let end = (offset + cols).min(self.text.len());
+        let visible: String = self.text[offset..end].iter().collect();
+        c.text(
+            tx,
+            ty,
+            &visible,
+            &font::REGULAR,
+            theme::TEXT,
+            tx + cols * CELL_W,
+        );
+        if caret {
+            // Tamzen leaves a cell's first column blank (all but "_{£"), so the bar goes
+            // there.
+            let cx = tx + (self.caret - offset) * CELL_W;
+            c.rect(cx, ty, 1, CELL_H, theme::TEXT);
+        }
+    }
+
     fn insert(&mut self, s: &str) {
         let chars: Vec<char> = s.chars().filter(|c| !c.is_control()).collect();
         let n = chars.len();
@@ -167,6 +234,7 @@ enum Action {
     Choice(Choice),
     Submit,
     Delete,
+    Replace,
     Open,
     Dismiss,
 }
@@ -216,8 +284,16 @@ struct Layout {
     items: Vec<Item>,
 }
 
-fn btn_w(label: &str) -> usize {
+pub fn btn_w(label: &str) -> usize {
     label.len() * CELL_W + 2 * BTN_PAD
+}
+
+/// A `btn_w(label)` x BTN_H button at (x, y); `hot` while hovered.
+pub fn draw_button(c: &mut Canvas, x: usize, y: usize, label: &str, hot: bool) {
+    c.rect(x, y, btn_w(label), BTN_H, theme::BORDER);
+    let color = if hot { theme::TEXT } else { theme::TEXT_DIM };
+    let ty = y + (BTN_H - CELL_H) / 2;
+    c.text(x + BTN_PAD, ty, label, &font::REGULAR, color, x + btn_w(label));
 }
 
 impl Block {
@@ -333,10 +409,7 @@ impl Modal {
     pub fn rename(path: PathBuf, old: String, is_dir: bool) -> Self {
         let caret = crate::ops::ext_start(&old, is_dir);
         Self::new(Kind::Prompt {
-            field: Field {
-                text: old.chars().collect(),
-                caret,
-            },
+            field: Field::new(&old, caret),
             purpose: Prompt::Rename { path, old },
             error: None,
             pending: false,
@@ -396,6 +469,9 @@ impl Modal {
             Kind::ConfirmDelete { .. } => {
                 vec![("Delete", Action::Delete), ("Cancel", Action::Dismiss)]
             }
+            Kind::ConfirmReplace { .. } => {
+                vec![("Replace", Action::Replace), ("Cancel", Action::Dismiss)]
+            }
             Kind::Prompt { purpose, .. } => {
                 let label = match purpose {
                     Prompt::NewFolder => "Create",
@@ -436,6 +512,10 @@ impl Modal {
                     Some(name) => format!("Permanently delete \"{name}\"?"),
                     None => format!("Permanently delete {} items?", paths.len()),
                 };
+                lines(&mut blocks, &msg, theme::TEXT);
+            }
+            Kind::ConfirmReplace { name, .. } => {
+                let msg = format!("\"{name}\" already exists. Replace it?");
                 lines(&mut blocks, &msg, theme::TEXT);
             }
             Kind::Errors { verb, errors } => {
@@ -619,9 +699,7 @@ impl Modal {
                 let (Some((r, cols)), Some(field)) = (found, self.field_mut()) else {
                     return (false, None);
                 };
-                let tx = r.x + 1 + FIELD_PAD;
-                let col = (px.saturating_sub(tx) + CELL_W / 2) / CELL_W;
-                field.caret = (field.offset(cols) + col).min(field.text.len());
+                field.click(px, r.x, cols);
                 (true, None)
             }
             Some(Hit::Row(i)) => {
@@ -700,6 +778,9 @@ impl Modal {
             (Action::Delete, Kind::ConfirmDelete { paths, .. }) => {
                 Some(Outcome::Delete(std::mem::take(paths)))
             }
+            (Action::Replace, Kind::ConfirmReplace { path, .. }) => {
+                Some(Outcome::Replace(path.clone()))
+            }
             (Action::Submit, Kind::Prompt { field, pending, .. }) => {
                 if *pending {
                     return None;
@@ -734,9 +815,14 @@ impl Modal {
     /// Keyboard input: editing keys for the name field; Enter/Esc also confirm or cancel
     /// a delete. Returns (redraw, outcome).
     pub fn key(&mut self, input: Input) -> (bool, Option<Outcome>) {
-        if let Kind::ConfirmDelete { .. } = self.kind {
+        let confirm = match self.kind {
+            Kind::ConfirmDelete { .. } => Some(Action::Delete),
+            Kind::ConfirmReplace { .. } => Some(Action::Replace),
+            _ => None,
+        };
+        if let Some(action) = confirm {
             return match input {
-                Input::Enter => (true, self.act(Action::Delete)),
+                Input::Enter => (true, self.act(action)),
                 Input::Escape => (true, Some(Outcome::Dismissed)),
                 _ => (false, None),
             };
@@ -751,13 +837,9 @@ impl Modal {
             Input::Enter => return (true, self.act(Action::Submit)),
             Input::Up | Input::Down => return (false, None),
             Input::Escape => return (true, Some(Outcome::Dismissed)),
-            Input::Text(s) => field.insert(&s),
-            Input::Backspace { word } => field.backspace(word),
-            Input::Delete => field.delete(),
-            Input::Left => field.caret = field.caret.saturating_sub(1),
-            Input::Right => field.caret = (field.caret + 1).min(field.text.len()),
-            Input::Home => field.caret = 0,
-            Input::End => field.caret = field.text.len(),
+            input => {
+                field.edit(input);
+            }
         }
         // The error was about the old name.
         *error = None;
@@ -795,13 +877,9 @@ impl Modal {
                 }
                 return (true, None);
             }
-            Input::Text(s) => field.insert(&s),
-            Input::Backspace { word } => field.backspace(word),
-            Input::Delete => field.delete(),
-            Input::Left => field.caret = field.caret.saturating_sub(1),
-            Input::Right => field.caret = (field.caret + 1).min(field.text.len()),
-            Input::Home => field.caret = 0,
-            Input::End => field.caret = field.text.len(),
+            input => {
+                field.edit(input);
+            }
         }
         // The filter changed: start from the best match again.
         *highlight = 0;
@@ -823,27 +901,9 @@ impl Modal {
                     c.text(*x, *y, s, &font::REGULAR, *color, right);
                 }
                 Item::Field(r, cols) => {
-                    let Some(field) = self.field() else {
-                        continue;
-                    };
-                    c.rect(r.x, r.y, r.w, r.h, theme::BG);
-                    c.frame(r.x, r.y, r.w, r.h, theme::BORDER);
-                    let (tx, ty) = (r.x + 1 + FIELD_PAD, r.y + (FIELD_H - CELL_H) / 2);
-                    let offset = field.offset(*cols);
-                    let end = (offset + cols).min(field.text.len());
-                    let visible: String = field.text[offset..end].iter().collect();
-                    c.text(
-                        tx,
-                        ty,
-                        &visible,
-                        &font::REGULAR,
-                        theme::TEXT,
-                        tx + cols * CELL_W,
-                    );
-                    // Tamzen leaves a cell's first column blank (all but "_{£"), so the
-                    // bar goes there.
-                    let cx = tx + (field.caret - offset) * CELL_W;
-                    c.rect(cx, ty, 1, CELL_H, theme::TEXT);
+                    if let Some(field) = self.field() {
+                        field.draw(c, r.x, r.y, r.w, *cols, true);
+                    }
                 }
                 Item::Check(r, label) => {
                     let hot = self.hover == Some(Hit::Check);
@@ -866,10 +926,7 @@ impl Modal {
                 Item::Button(r, label) => {
                     let hot = self.hover == Some(Hit::Button(button));
                     button += 1;
-                    c.rect(r.x, r.y, r.w, r.h, theme::BORDER);
-                    let color = if hot { theme::TEXT } else { theme::TEXT_DIM };
-                    let ty = r.y + (BTN_H - CELL_H) / 2;
-                    c.text(r.x + BTN_PAD, ty, label, &font::REGULAR, color, r.x + r.w);
+                    draw_button(c, r.x, r.y, label, hot);
                 }
             }
         }

@@ -176,6 +176,22 @@ impl App {
             self.modal_key(input);
             return false;
         }
+        if let Some(ch) = &self.chooser {
+            if ch.typing {
+                self.load_xkb();
+                return self.text_key(key);
+            }
+            if !self.ctrl && !self.shift && !self.alt {
+                match key {
+                    KEY_ESC => self.exit = true,
+                    KEY_ENTER | KEY_KPENTER => self.dialog_accept(),
+                    _ => {}
+                }
+                if matches!(key, KEY_ESC | KEY_ENTER | KEY_KPENTER) {
+                    return false;
+                }
+            }
+        }
         if self.alt {
             if !self.ctrl && !self.shift && matches!(key, KEY_ENTER | KEY_KPENTER) {
                 if let Some(file) = self.view.open_with_target() {
@@ -256,17 +272,23 @@ impl App {
             _ => return false,
         };
         self.apply(effect);
+        self.sync_save_name();
         true
     }
 
     /// Loads the keyboard layout on first use, then shows the modal.
     pub(super) fn open_text_modal(&mut self, modal: Modal) {
+        self.load_xkb();
+        self.push_modal(modal);
+    }
+
+    /// Text entry needs the keyboard layout; it's compiled on first use.
+    fn load_xkb(&mut self) {
         if self.xkb.is_none() {
             if let Some(keymap) = &self.keymap {
                 self.xkb = Xkb::load(keymap, self.mods);
             }
         }
-        self.push_modal(modal);
     }
 
     fn text_key(&mut self, key: u32) -> bool {
@@ -297,8 +319,18 @@ impl App {
             },
         };
         let repeat = repeats && !matches!(input, Input::Enter | Input::Escape);
-        self.modal_key(input);
+        self.text_input(input);
         repeat
+    }
+
+    /// A text key goes to the modal's field, or else the dialog's name field.
+    fn text_input(&mut self, input: Input) {
+        if !self.modals.is_empty() {
+            self.modal_key(input);
+        } else if let Some(ch) = self.chooser.as_mut() {
+            let action = ch.key(input);
+            self.dialog_action(action);
+        }
     }
 
     fn modal_key(&mut self, input: Input) {
@@ -343,8 +375,12 @@ impl App {
     /// Names are one line, so only the clipboard's first line is inserted.
     pub(super) fn pasted(&mut self, text: String) {
         let line = text.lines().next().unwrap_or_default();
-        if !line.is_empty() && self.modals.front().is_some_and(Modal::takes_text) {
-            self.modal_key(Input::Text(line.to_string()));
+        let typing = match self.modals.front() {
+            Some(modal) => modal.takes_text(),
+            None => self.chooser.as_ref().is_some_and(|c| c.typing),
+        };
+        if !line.is_empty() && typing {
+            self.text_input(Input::Text(line.to_string()));
         }
     }
 }

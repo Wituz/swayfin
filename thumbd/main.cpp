@@ -323,6 +323,9 @@ private:
 int main(int argc, char **argv) {
     // Headless: never connect to the compositor.
     qputenv("QT_QPA_PLATFORM", "offscreen");
+    // The session's platform theme (xdgdesktopportal, for file dialogs) would talk to
+    // the portal at startup for nothing.
+    qunsetenv("QT_QPA_PLATFORMTHEME");
     QGuiApplication app(argc, argv);
     // Finished KIO jobs release event-loop locks, which would otherwise quit the app
     // between batches. Only stdin closing ends the helper.
