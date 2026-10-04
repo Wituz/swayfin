@@ -15,6 +15,7 @@ use xkbcommon_dl::keysyms as k;
 
 use super::App;
 use crate::{
+    downloads,
     modal::{Input, Modal},
     ops,
     view::Effect,
@@ -32,6 +33,7 @@ const KEY_ENTER: u32 = 28;
 const KEY_E: u32 = 18;
 const KEY_P: u32 = 25;
 const KEY_A: u32 = 30;
+const KEY_D: u32 = 32;
 const KEY_X: u32 = 45;
 const KEY_C: u32 = 46;
 const KEY_V: u32 = 47;
@@ -223,6 +225,16 @@ impl App {
             }
             (true, false, KEY_V) => {
                 self.paste_files();
+                return false;
+            }
+            (true, false, KEY_D) => {
+                if let Some(modal) = self.view.duplicate_target() {
+                    self.open_text_modal(modal);
+                }
+                return false;
+            }
+            (false, true, KEY_D) => {
+                downloads::toggle(self.view.listing.path.clone());
                 return false;
             }
             (true, false, KEY_N) => {

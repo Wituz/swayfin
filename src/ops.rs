@@ -13,7 +13,10 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::mpsc,
+    sync::{
+        mpsc,
+        atomic::{AtomicU64, Ordering},
+    },
     thread,
 };
 
@@ -65,7 +68,7 @@ pub enum JobMsg {
         paths: Vec<PathBuf>,
         cut: bool,
     },
-    /// A create or rename finished: the new path, or the reason it failed.
+    /// A create, rename or duplicate finished: the new path, or the reason it failed.
     Named(Result<PathBuf, String>),
 }
 
@@ -309,6 +312,41 @@ pub fn spawn_rename(path: PathBuf, name: String, ui: Sender<JobMsg>) {
         let result = match rename(&path, &dst, false) {
             Ok(()) => Ok(dst),
             Err(e) => Err(name_error(&e, &name, dir)),
+        };
+        let _ = ui.send(JobMsg::Named(result));
+    });
+}
+
+/// Copies `path` (folders recursively) as `name` in the same folder, never replacing an
+/// existing item. The copy is made under a hidden temp name, then renamed into place.
+pub fn spawn_duplicate(path: PathBuf, name: String, ui: Sender<JobMsg>) {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    thread::spawn(move || {
+        let dst = path.with_file_name(&name);
+        let dir = path.parent().unwrap_or(Path::new("/"));
+        let result = if lstat(&dst).is_some() {
+            Err(format!("\"{name}\" already exists."))
+        } else {
+            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+            let tmp = dst.with_file_name(format!(".swayfin-{}-dup{seq}", std::process::id()));
+            match copy_tree(&path, &tmp) {
+                Err((at, e)) => {
+                    let _ = remove_tree(&tmp);
+                    let mut why = explain(&e, &[dir]);
+                    if at != path {
+                        let rel = at.strip_prefix(&path).unwrap_or(&at);
+                        why = format!("{why} (at {})", rel.to_string_lossy());
+                    }
+                    Err(why)
+                }
+                Ok(()) => match rename(&tmp, &dst, false) {
+                    Ok(()) => Ok(dst),
+                    Err(e) => {
+                        let _ = remove_tree(&tmp);
+                        Err(name_error(&e, &name, dir))
+                    }
+                },
+            }
         };
         let _ = ui.send(JobMsg::Named(result));
     });
@@ -620,9 +658,48 @@ fn lstat(path: &Path) -> Option<Metadata> {
     fs::symlink_metadata(path).ok()
 }
 
-/// `name_N.ext` for files (the suffix goes before the first dot, ignoring a leading one),
-/// `name_N` for folders; the first N that's free.
 fn suffixed(dest: &Path, name: &OsStr, is_dir: bool) -> PathBuf {
+    dest.join(suffixed_name(name, is_dir, |n| lstat(&dest.join(n)).is_some()))
+}
+
+/// Moves `src` into the folder `dest`, as `name_N.ext` if its name is taken there. For
+/// the downloads redirect, which has no UI to ask.
+pub fn move_free(src: &Path, dest: &Path) -> io::Result<()> {
+    let name = name_of(src);
+    let is_dir = lstat(src).is_some_and(|m| m.is_dir());
+    let free = || {
+        let plain = dest.join(name);
+        if lstat(&plain).is_none() {
+            plain
+        } else {
+            suffixed(dest, name, is_dir)
+        }
+    };
+    // Something may take the free name before the rename: pick again.
+    let place = |from: &Path| loop {
+        match rename(from, &free(), false) {
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            r => return r,
+        }
+    };
+    match place(src) {
+        Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {}
+        r => return r,
+    }
+    // Another file system: copy to a hidden temp name, rename that into place, then
+    // delete the original.
+    let tmp = dest.join(format!(".swayfin-{}-download", std::process::id()));
+    if let Err(e) = copy_tree(src, &tmp).and_then(|()| place(&tmp).map_err(|e| (tmp.clone(), e)))
+    {
+        let _ = remove_tree(&tmp);
+        return Err(e.1);
+    }
+    remove_tree(src).map_err(|e| e.1)
+}
+
+/// `name_N.ext` for files (the suffix goes before the first dot, ignoring a leading one),
+/// `name_N` for folders; the first N that isn't `taken`.
+pub fn suffixed_name(name: &OsStr, is_dir: bool, taken: impl Fn(&OsStr) -> bool) -> OsString {
     let bytes = name.as_bytes();
     let split = if is_dir {
         bytes.len()
@@ -639,9 +716,9 @@ fn suffixed(dest: &Path, name: &OsStr, is_dir: bool) -> PathBuf {
             let mut s = stem.to_vec();
             s.extend_from_slice(format!("_{n}").as_bytes());
             s.extend_from_slice(ext);
-            dest.join(OsStr::from_bytes(&s))
+            OsString::from_vec(s)
         })
-        .find(|p| lstat(p).is_none())
+        .find(|n| !taken(n))
         .unwrap()
 }
 

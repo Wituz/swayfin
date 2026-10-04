@@ -28,6 +28,8 @@ const MASK: u32 = libc::IN_CREATE
 pub struct Watcher {
     fd: OwnedFd,
     wd: Option<i32>,
+    /// The downloads redirect's state folder.
+    state_wd: Option<i32>,
 }
 
 impl AsFd for Watcher {
@@ -45,7 +47,11 @@ impl Watcher {
         }
         // SAFETY: a fresh fd we own.
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        Ok(Self { fd, wd: None })
+        Ok(Self {
+            fd,
+            wd: None,
+            state_wd: None,
+        })
     }
 
     /// Watches `dir` instead of the previous folder. A folder that can't be watched
@@ -64,15 +70,30 @@ impl Watcher {
         self.wd = (wd >= 0).then_some(wd);
     }
 
-    /// Reads all pending events. Returns true if any were for the current watch.
-    pub fn drain(&mut self) -> bool {
+    /// Also watches the downloads redirect's state folder (creating it), for its state
+    /// file being replaced or removed.
+    pub fn watch_state(&mut self, dir: &Path) {
+        let _ = std::fs::create_dir_all(dir);
+        let Ok(c) = CString::new(dir.as_os_str().as_bytes()) else {
+            return;
+        };
+        let mask = libc::IN_MOVED_TO | libc::IN_DELETE | libc::IN_ONLYDIR;
+        // SAFETY: valid NUL-terminated path.
+        let wd = unsafe { libc::inotify_add_watch(self.fd.as_raw_fd(), c.as_ptr(), mask) };
+        self.state_wd = (wd >= 0).then_some(wd);
+    }
+
+    /// Reads all pending events. Returns whether any were for the current folder, and
+    /// whether any were for the redirect state.
+    pub fn drain(&mut self) -> (bool, bool) {
         let mut buf = [0u8; 4096];
         let mut relevant = false;
+        let mut state = false;
         loop {
             // SAFETY: reading into our own buffer from our non-blocking fd.
             let n = unsafe { libc::read(self.fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
             if n <= 0 {
-                return relevant;
+                return (relevant, state);
             }
             let mut off = 0;
             let head = std::mem::size_of::<libc::inotify_event>();
@@ -83,6 +104,7 @@ impl Watcher {
                 };
                 // Events for a watch we already removed can still be queued.
                 relevant |= Some(ev.wd) == self.wd;
+                state |= Some(ev.wd) == self.state_wd;
                 off += head + ev.len as usize;
             }
         }

@@ -11,6 +11,7 @@ use crate::{
     fs::Listing,
     modal::{self, Modal},
     render::Canvas,
+    sort::{self, KEYS, Key},
     theme,
     thumbs::{self, Thumb},
 };
@@ -26,6 +27,9 @@ const UP_W: usize = HEADER_H;
 const SIZE_W: usize = 10 * CELL_W;
 const DATE_W: usize = 16 * CELL_W;
 const COL_GAP: usize = 2 * CELL_W;
+/// Sort buttons: padding either side, a 4-char label, a gap, then the 7px direction arrow.
+const SORT_PAD: usize = 6;
+const SORT_W: usize = SORT_PAD + 4 * CELL_W + 4 + 7 + SORT_PAD;
 /// Names start after the thumbnail column, which every row reserves.
 const NAME_X: usize = PAD + thumbs::SIZE + 6;
 const SCROLL_ROWS: f64 = 3.0;
@@ -54,6 +58,7 @@ enum DropTarget {
 #[derive(Clone, Copy, PartialEq)]
 enum Target {
     Up,
+    Sort(Key),
     Row(usize),
     /// List area below the last row.
     Blank,
@@ -69,6 +74,8 @@ pub enum Effect {
     TogglePlay(PathBuf),
     /// Start a drag of these paths, with this label on the drag icon.
     StartDrag(Vec<PathBuf>, String),
+    /// The listing was re-sorted by a header button.
+    Sorted,
 }
 
 pub struct View {
@@ -101,6 +108,8 @@ pub struct View {
     select_next: Option<OsString>,
     /// Scroll and selection to put back when the next listing of its folder arrives.
     restore: Option<ViewState>,
+    /// Where downloads are redirected to (Shift+D), and its header label.
+    redirect: Option<(PathBuf, String)>,
 }
 
 impl View {
@@ -125,7 +134,24 @@ impl View {
             toggle_on_release: None,
             select_next: None,
             restore: None,
+            redirect: None,
         }
+    }
+
+    /// Shows the downloads redirect in the header: its folder, with ~ for home.
+    pub fn set_redirect(&mut self, to: Option<PathBuf>) {
+        self.redirect = to.map(|path| {
+            let home = std::env::var_os("HOME").map(PathBuf::from);
+            let label = match home.as_deref().and_then(|h| path.strip_prefix(h).ok()) {
+                Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+                Some(rest) => format!("~/{}", rest.to_string_lossy()),
+                None => path.to_string_lossy().into_owned(),
+            };
+            // Only the tail of a long one.
+            let skip = label.chars().count().saturating_sub(REDIRECT_MAX);
+            (path, label.chars().skip(skip).collect())
+        });
+        self.update_hover();
     }
 
     /// Installs a freshly read listing. A new listing of the same folder (a refresh)
@@ -148,36 +174,7 @@ impl View {
         let n = self.listing.entries.len();
 
         if same {
-            let remap = |i: usize| old.entries.get(i).and_then(|e| find(&e.raw));
-            let names = |flags: &[bool]| -> Vec<bool> {
-                let mut out = vec![false; n];
-                for (e, _) in old.entries.iter().zip(flags).filter(|(_, f)| **f) {
-                    if let Some(j) = find(&e.raw) {
-                        out[j] = true;
-                    }
-                }
-                out
-            };
-            self.selected = names(&self.selected);
-            self.base = names(&self.base);
-            let row = |t: Option<Target>| match t {
-                Some(Target::Row(i)) => remap(i).map(Target::Row),
-                other => other,
-            };
-            self.pressed = row(self.pressed);
-            self.anchor = self.anchor.and_then(remap);
-            self.cursor = self.cursor.and_then(remap);
-            self.collapse_to = self.collapse_to.and_then(remap);
-            self.toggle_on_release = self.toggle_on_release.and_then(remap);
-            self.last_click = self.last_click.and_then(|(i, t)| remap(i).map(|j| (j, t)));
-            self.drag = self
-                .drag
-                .take()
-                .map(|rows| rows.into_iter().filter_map(remap).collect());
-            self.drop_target = match self.drop_target {
-                Some(DropTarget::Row(i)) => remap(i).map(DropTarget::Row),
-                other => other,
-            };
+            self.remap_rows(n, |i| old.entries.get(i).and_then(|e| find(&e.raw)));
         } else {
             self.selected = vec![false; n];
             self.scroll = 0;
@@ -202,17 +199,61 @@ impl View {
             self.drag = None;
             self.drop_target = None;
         }
-        // A renamed item, or the folder we came up from: selected, and the last-touched
-        // row so arrows continue from it.
+        // A renamed or duplicated item, or the folder we came up from: the only one
+        // selected, and the last-touched row so arrows continue from it.
         if let Some(i) = select_next.as_ref().and_then(find) {
-            self.selected[i] = true;
-            self.base[i] = true;
-            self.anchor = Some(i);
-            self.cursor = Some(i);
+            self.select_only(i);
             self.scroll_into_view(i);
         }
         self.scroll = self.scroll.min(self.max_scroll());
         self.update_hover();
+    }
+
+    /// Moves all per-row state to new row indices (`n` rows now); rows that `remap`
+    /// drops lose theirs.
+    fn remap_rows(&mut self, n: usize, remap: impl Fn(usize) -> Option<usize>) {
+        let flags = |flags: &[bool]| -> Vec<bool> {
+            let mut out = vec![false; n];
+            for j in (0..flags.len()).filter(|&i| flags[i]).filter_map(&remap) {
+                out[j] = true;
+            }
+            out
+        };
+        self.selected = flags(&self.selected);
+        self.base = flags(&self.base);
+        self.pressed = match self.pressed {
+            Some(Target::Row(i)) => remap(i).map(Target::Row),
+            other => other,
+        };
+        self.anchor = self.anchor.and_then(&remap);
+        self.cursor = self.cursor.and_then(&remap);
+        self.collapse_to = self.collapse_to.and_then(&remap);
+        self.toggle_on_release = self.toggle_on_release.and_then(&remap);
+        self.last_click = self.last_click.and_then(|(i, t)| remap(i).map(|j| (j, t)));
+        self.drag = self
+            .drag
+            .take()
+            .map(|rows| rows.into_iter().filter_map(&remap).collect());
+        self.drop_target = match self.drop_target {
+            Some(DropTarget::Row(i)) => remap(i).map(DropTarget::Row),
+            other => other,
+        };
+    }
+
+    /// A sort button was clicked: re-sort in place, keeping selection and scroll.
+    fn sort_by(&mut self, key: Key) -> Effect {
+        let mut sort = self.listing.sort;
+        sort.click(key);
+        let order = sort::order(&self.listing.entries, sort);
+        let mut new_index = vec![0; order.len()];
+        for (new, &old) in order.iter().enumerate() {
+            new_index[old] = new;
+        }
+        sort::permute(&mut self.listing.entries, &order);
+        self.listing.sort = sort;
+        self.remap_rows(order.len(), |i| Some(new_index[i]));
+        self.update_hover();
+        Effect::Sorted
     }
 
     /// Where the view is, for coming back to it via history.
@@ -252,6 +293,20 @@ impl View {
         ))
     }
 
+    /// The duplicate modal for the selection, if exactly one item is selected. The
+    /// suggested name is free among the listed names.
+    pub fn duplicate_target(&self) -> Option<Modal> {
+        let e = &self.listing.entries[self.single_selected()?];
+        let taken = |n: &std::ffi::OsStr| self.listing.entries.iter().any(|e| e.raw == n);
+        let name = crate::ops::suffixed_name(&e.raw, e.is_dir, taken);
+        Some(Modal::duplicate(
+            self.listing.path.join(&e.raw),
+            e.name.clone(),
+            name.to_string_lossy().into_owned(),
+            e.is_dir,
+        ))
+    }
+
     pub fn resize(&mut self, w: usize, h: usize) {
         self.w = w;
         self.h = h;
@@ -267,9 +322,41 @@ impl View {
         self.listing.path.parent().map(PathBuf::from)
     }
 
+    /// Right end of the header's right-aligned items: left of the "dotfiles" label.
+    fn dotfiles_left(&self) -> usize {
+        let right = self.w.saturating_sub(PAD);
+        if self.listing.dotfiles {
+            right.saturating_sub(DOTFILES.len() * CELL_W + COL_GAP)
+        } else {
+            right
+        }
+    }
+
+    /// Left of the downloads redirect label, which is left of "dotfiles".
+    fn header_right(&self) -> usize {
+        let right = self.dotfiles_left();
+        match &self.redirect {
+            Some((_, label)) => {
+                right.saturating_sub(REDIRECT_ICON_W + label.chars().count() * CELL_W + COL_GAP)
+            }
+            None => right,
+        }
+    }
+
+    /// Left edge of the sort buttons (Name, Date, Type, side by side).
+    fn sort_x(&self) -> usize {
+        self.header_right().saturating_sub(KEYS.len() * SORT_W)
+    }
+
     fn hit(&self, x: usize, y: usize) -> Option<Target> {
         if y < HEADER_H {
-            return (x < UP_W).then_some(Target::Up);
+            if x < UP_W {
+                return Some(Target::Up);
+            }
+            let sx = self.sort_x();
+            return (sx..sx + KEYS.len() * SORT_W)
+                .contains(&x)
+                .then(|| Target::Sort(KEYS[(x - sx) / SORT_W]));
         }
         let i = (y - HEADER_H + self.scroll) / ROW_H;
         Some(if i < self.listing.entries.len() {
@@ -659,6 +746,7 @@ impl View {
             (Some(Target::Up), Some(Target::Up)) => {
                 self.up_target().map_or(Effect::None, Effect::Navigate)
             }
+            (Some(Target::Sort(a)), Some(Target::Sort(b))) if a == b => self.sort_by(a),
             _ => Effect::None,
         }
     }
@@ -862,13 +950,47 @@ impl View {
         draw_up_arrow(c, (UP_W - 7) / 2, (HEADER_H - 1 - 9) / 2, arrow);
 
         let ty = (HEADER_H - 1 - CELL_H) / 2;
-        let mut right = self.w.saturating_sub(PAD);
         if self.listing.dotfiles {
-            const LABEL: &str = "dotfiles";
-            right = right.saturating_sub(LABEL.len() * CELL_W);
-            c.text(right, ty, LABEL, &font::REGULAR, theme::TEXT_DIM, self.w);
-            right = right.saturating_sub(COL_GAP);
+            let x = self.w.saturating_sub(PAD + DOTFILES.len() * CELL_W);
+            c.text(x, ty, DOTFILES, &font::REGULAR, theme::TEXT_DIM, self.w);
         }
+
+        // Downloads redirect: a down arrow and the folder, bright while in it.
+        if let Some((path, label)) = &self.redirect {
+            let color = if *path == self.listing.path {
+                theme::TEXT
+            } else {
+                theme::TEXT_DIM
+            };
+            let x = self.header_right() + COL_GAP;
+            draw_down_arrow(c, x, (HEADER_H - 1 - 9) / 2, color);
+            let right = self.dotfiles_left();
+            c.text(x + REDIRECT_ICON_W, ty, label, &font::REGULAR, color, right);
+        }
+
+        // Sort buttons: the active one bright, with its direction.
+        let sort = self.listing.sort;
+        let sx = self.sort_x();
+        for (k, &key) in KEYS.iter().enumerate() {
+            let x = sx + k * SORT_W;
+            if self.hover == Some(Target::Sort(key)) {
+                c.rect(x, 0, SORT_W, HEADER_H - 1, theme::BORDER);
+            }
+            let label = match key {
+                Key::Name => "Name",
+                Key::Date => "Date",
+                Key::Type => "Type",
+            };
+            let active = key == sort.key;
+            let color = if active { theme::TEXT } else { theme::TEXT_DIM };
+            let lx = x + SORT_PAD;
+            c.text(lx, ty, label, &font::REGULAR, color, lx + 4 * CELL_W);
+            if active {
+                let ax = lx + 4 * CELL_W + 4;
+                draw_sort_arrow(c, ax, (HEADER_H - 1 - 4) / 2, sort.desc(), color);
+            }
+        }
+        let right = sx.saturating_sub(COL_GAP);
 
         // Show the tail of the path when it doesn't fit.
         let x = UP_W + PAD;
@@ -879,6 +1001,12 @@ impl View {
         c.text(x, ty, &tail, &font::REGULAR, theme::TEXT, right);
     }
 }
+
+const DOTFILES: &str = "dotfiles";
+/// The redirect label's arrow and the gap after it.
+const REDIRECT_ICON_W: usize = 7 + 6;
+/// Longest redirect label, in characters.
+const REDIRECT_MAX: usize = 40;
 
 fn redraw_if(changed: bool) -> Effect {
     if changed {
@@ -907,6 +1035,22 @@ fn draw_pause_icon(c: &mut Canvas, x: usize, y: usize, color: u32) {
 fn draw_folder_icon(c: &mut Canvas, x: usize, y: usize) {
     c.rect(x, y + 2, 6, 2, theme::TEXT_DIM);
     c.rect(x, y + 4, thumbs::SIZE, 10, theme::TEXT_DIM);
+}
+
+/// 7x4 pixel triangle: pointing up for ascending, down for descending.
+fn draw_sort_arrow(c: &mut Canvas, x: usize, y: usize, desc: bool, color: u32) {
+    for r in 0..4 {
+        let row = if desc { 3 - r } else { r };
+        c.rect(x + 3 - row, y + r, 2 * row + 1, 1, color);
+    }
+}
+
+/// 7x9 pixel arrow pointing down: a 1px stem over a solid triangle head.
+fn draw_down_arrow(c: &mut Canvas, x: usize, y: usize, color: u32) {
+    c.rect(x + 3, y, 1, 5, color);
+    for r in 0..4 {
+        c.rect(x + r, y + 5 + r, 7 - 2 * r, 1, color);
+    }
 }
 
 /// 7x9 pixel arrow: a solid triangle head on a 1px stem.

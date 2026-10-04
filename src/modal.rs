@@ -73,6 +73,7 @@ pub enum Kind {
 pub enum Prompt {
     NewFolder,
     Rename { path: PathBuf, old: String },
+    Duplicate { path: PathBuf, old: String },
     GoTo,
 }
 
@@ -416,6 +417,17 @@ impl Modal {
         })
     }
 
+    /// Prefilled with a free `name_N.ext`, caret before the extension.
+    pub fn duplicate(path: PathBuf, old: String, name: String, is_dir: bool) -> Self {
+        let caret = crate::ops::ext_start(&name, is_dir);
+        Self::new(Kind::Prompt {
+            field: Field::new(&name, caret),
+            purpose: Prompt::Duplicate { path, old },
+            error: None,
+            pending: false,
+        })
+    }
+
     pub fn prompt_for(&self) -> Option<&Prompt> {
         match &self.kind {
             Kind::Prompt { purpose, .. } => Some(purpose),
@@ -476,6 +488,7 @@ impl Modal {
                 let label = match purpose {
                     Prompt::NewFolder => "Create",
                     Prompt::Rename { .. } => "Rename",
+                    Prompt::Duplicate { .. } => "Duplicate",
                     Prompt::GoTo => "Go",
                 };
                 vec![(label, Action::Submit), ("Cancel", Action::Dismiss)]
@@ -546,6 +559,9 @@ impl Modal {
                     Prompt::NewFolder => blocks.push(Block::Line("New folder".into(), theme::TEXT)),
                     Prompt::Rename { old, .. } => {
                         lines(&mut blocks, &format!("Rename \"{old}\""), theme::TEXT)
+                    }
+                    Prompt::Duplicate { old, .. } => {
+                        lines(&mut blocks, &format!("Duplicate \"{old}\""), theme::TEXT)
                     }
                     Prompt::GoTo => {
                         blocks.push(Block::Line("Quick go-to folder".into(), theme::TEXT))

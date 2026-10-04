@@ -1,5 +1,6 @@
 mod app;
 mod chooser;
+mod downloads;
 mod font;
 mod fs;
 mod mime;
@@ -7,6 +8,7 @@ mod modal;
 mod ops;
 mod player;
 mod render;
+mod sort;
 mod theme;
 mod thumbs;
 mod video;
@@ -24,6 +26,10 @@ use smithay_client_toolkit::reexports::{
 fn main() {
     // A file dialog for the portal, or the file manager in the home folder.
     let args: Vec<_> = env::args_os().skip(1).collect();
+    if args.first().is_some_and(|a| a == downloads::DAEMON_ARG) {
+        downloads::daemon();
+        return;
+    }
     let (chooser, start, select) = match chooser::from_args(&args) {
         Some((chooser, start, select)) => (Some(chooser), start, select),
         None => {

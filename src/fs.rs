@@ -9,6 +9,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use crate::sort::{self, Sort};
+
 pub struct Entry {
     pub raw: OsString,
     pub name: String,
@@ -31,23 +33,36 @@ pub struct Listing {
     pub error: Option<String>,
     /// Whether dotfiles were included.
     pub dotfiles: bool,
+    pub sort: Sort,
 }
 
+impl Listing {
+    pub fn sort_by(&mut self, sort: Sort) {
+        let order = sort::order(&self.entries, sort);
+        sort::permute(&mut self.entries, &order);
+        self.sort = sort;
+    }
+}
+
+/// Reads `path`, sorted the way it was last sorted.
 pub fn list(path: PathBuf, dotfiles: bool) -> Listing {
     let (entries, error) = match read(&path, dotfiles) {
         Ok(entries) => (entries, None),
         Err(e) => (Vec::new(), Some(e.kind().to_string())),
     };
-    Listing {
+    let sort = sort::get(&path);
+    let mut listing = Listing {
         path,
         entries,
         error,
         dotfiles,
-    }
+        sort,
+    };
+    listing.sort_by(sort);
+    listing
 }
 
-/// Folders first, then case-insensitive by name. Dotfiles only if `dotfiles`; names
-/// listed in the folder's `.hidden` file (one per line) never, except `.hidden` itself.
+/// Unsorted. Dotfiles only if `dotfiles`; names listed in the folder's `.hidden` file (one per line) never, except `.hidden` itself.
 fn read(path: &Path, dotfiles: bool) -> io::Result<Vec<Entry>> {
     let hidden: HashSet<OsString> = fs::read(path.join(".hidden"))
         .map(|bytes| {
@@ -90,7 +105,6 @@ fn read(path: &Path, dotfiles: bool) -> io::Result<Vec<Entry>> {
             dot,
         });
     }
-    entries.sort_by_cached_key(|e| (!e.is_dir, e.name.to_lowercase()));
     Ok(entries)
 }
 

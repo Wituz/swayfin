@@ -60,12 +60,13 @@ use smithay_client_toolkit::{
 
 use crate::{
     chooser::Chooser,
+    downloads,
     fs::{self, Listing},
     modal::{self, Modal, Outcome, Prompt},
     ops::{self, JobMsg},
     player::Player,
     render::Canvas,
-    theme,
+    sort, theme,
     thumbs::{self, Thumbnailer},
     video::{FrameBuf, Video},
     view::{Effect, Thumbs, View, ViewState},
@@ -285,7 +286,7 @@ impl App {
                 }
             })
             .expect("player channel");
-        let watcher = Watcher::new().ok();
+        let mut watcher = Watcher::new().ok();
         if let Some(fd) = watcher
             .as_ref()
             .and_then(|w| w.as_fd().try_clone_to_owned().ok())
@@ -343,6 +344,16 @@ impl App {
         // Initial bufferless commit; the compositor answers with a configure.
         window.commit();
 
+        // The header shows the downloads redirect. Tiny tmpfs reads while the configure
+        // is on its way.
+        if let Some(w) = &mut watcher {
+            w.watch_state(&downloads::state_dir());
+        }
+        let redirect = downloads::target();
+        if redirect.is_some() {
+            downloads::resume();
+        }
+
         // Sized for a typical tile; grows on first configure if needed.
         let pool = SlotPool::new(1280 * 720 * 4, &shm).expect("shm pool");
 
@@ -351,10 +362,13 @@ impl App {
             entries: Vec::new(),
             error: None,
             dotfiles: false,
+            // Not sort::get: that reads the saved sorts, which the loader does off-thread.
+            sort: Default::default(),
         });
         if let Some(name) = select {
             view.select_on_load(name);
         }
+        view.set_redirect(redirect);
 
         Self {
             registry: RegistryState::new(&globals),
@@ -480,7 +494,12 @@ impl App {
         let Some(watcher) = &mut self.watcher else {
             return;
         };
-        if !watcher.drain() || self.refresh_scheduled {
+        let (folder, redirect) = watcher.drain();
+        if redirect {
+            self.view.set_redirect(downloads::target());
+            self.request_redraw();
+        }
+        if !folder || self.refresh_scheduled {
             return;
         }
         self.refresh_scheduled = true;
@@ -533,7 +552,9 @@ impl App {
                 match result {
                     Ok(path) => {
                         let go_to = matches!(front.prompt_for(), Some(Prompt::GoTo));
-                        if let Some(Prompt::Rename { .. }) = front.prompt_for() {
+                        if let Some(Prompt::Rename { .. } | Prompt::Duplicate { .. }) =
+                            front.prompt_for()
+                        {
                             if let Some(name) = path.file_name() {
                                 self.view.select_on_load(name.to_os_string());
                             }
@@ -554,7 +575,8 @@ impl App {
         }
     }
 
-    /// A prompt was submitted: validate, then create, rename or query zoxide off-thread.
+    /// A prompt was submitted: validate, then create, rename, duplicate or query zoxide
+    /// off-thread.
     fn submit_prompt(&mut self, name: String) {
         let Some(front) = self.modals.front_mut() else {
             return;
@@ -578,6 +600,9 @@ impl App {
                 } else {
                     ops::spawn_rename(path.clone(), name, self.jobs.clone());
                 }
+            }
+            Some(Prompt::Duplicate { path, .. }) => {
+                ops::spawn_duplicate(path.clone(), name, self.jobs.clone())
             }
             Some(Prompt::GoTo) | None => {}
         }
@@ -699,9 +724,14 @@ impl App {
         }
     }
 
-    fn loaded(&mut self, seq: u64, listing: Listing) {
+    fn loaded(&mut self, seq: u64, mut listing: Listing) {
         // Drop answers to requests that were superseded by a newer navigation.
         if seq == self.load_seq {
+            // The sort was changed while this was being read.
+            let sort = sort::get(&listing.path);
+            if listing.sort != sort {
+                listing.sort_by(sort);
+            }
             if listing.path != self.view.listing.path {
                 self.thumbnailer.cancel();
                 // Playback belongs to the folder it was started in.
@@ -969,6 +999,13 @@ impl App {
                 self.request_redraw();
             }
             Effect::StartDrag(paths, label) => self.start_drag(paths, label),
+            Effect::Sorted => {
+                let listing = &self.view.listing;
+                sort::set(listing.path.clone(), listing.sort);
+                // Other rows are on screen now: their thumbnails may be needed.
+                self.listing_gen += 1;
+                self.request_redraw();
+            }
         }
     }
 
