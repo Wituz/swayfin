@@ -28,7 +28,7 @@ And you can use it as handler for opening/saving files/folders/bits/bytes/whatev
 
 Probably a lot of other things, I have forgot about it can also do.
 
-I'll have Claude make a full list of features here  - tailored to arch users (overloads):
+I'll have Claude make a full list of features here  - tailored to arch users (overlords):
 
 ## Full feature list
 
